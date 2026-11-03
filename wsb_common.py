@@ -82,60 +82,84 @@ def assign_entry_day(created_utc: pd.Series, days: pd.DatetimeIndex) -> pd.Serie
 
 
 # --------------------------------------------------------------------------- reddit
-def _get_json(session, url, params, log, tries=6):
+RETRY_CODES = {408, 422, 425, 429, 500, 502, 503, 504, 520, 522, 524}
+WINDOW_SECONDS = 2 * 86400     # ask the archive for 2 days at a time; long ranges can time out
+
+
+class PartialDownload(Exception):
+    """Raised when a download stops early; .rows holds what was fetched before it stopped."""
+
+    def __init__(self, msg, rows):
+        super().__init__(msg)
+        self.rows = rows
+
+
+def _get(session, url, params, log, tries=8):
+    """GET with backoff on timeouts/rate limits. Returns the final response (may still be an error)."""
+    r = None
     for attempt in range(tries):
         try:
-            r = session.get(url, params=params, timeout=40)
-            if r.status_code == 429 or r.status_code >= 500:
-                wait = 5 * (attempt + 1)
-                log(f"    server busy ({r.status_code}); waiting {wait}s")
-                time.sleep(wait)
-                continue
-            return r
+            r = session.get(url, params=params, timeout=60)
+            if r.status_code not in RETRY_CODES:
+                return r
+            msg = r.text[:150].replace("\n", " ")
+            wait = min(10 * (attempt + 1), 90)
+            log(f"    server said {r.status_code} ({msg}); waiting {wait}s and retrying")
         except requests.RequestException as e:
-            log(f"    network error: {e}; retrying")
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"Could not reach {url}")
+            wait = min(10 * (attempt + 1), 90)
+            log(f"    network error ({e}); waiting {wait}s and retrying")
+        time.sleep(wait)
+    return r
 
 
 def fetch_posts_arctic(start_epoch: int, end_epoch: int, subreddit="wallstreetbets",
-                       log=print, pause=0.35) -> pd.DataFrame:
-    """Download every post in [start, end) from the Arctic Shift archive, oldest first."""
+                       log=print, pause=0.5, checkpoint=None) -> pd.DataFrame:
+    """Download every post in [start, end) from the Arctic Shift archive, oldest first.
+    On a hard failure raises PartialDownload carrying everything fetched so far."""
     s = requests.Session()
     s.headers["User-Agent"] = UA
     fields = ",".join(POST_COLS)
     use_fields = True
     after, rows, calls = int(start_epoch), [], 0
     while after < end_epoch:
-        params = dict(subreddit=subreddit, after=after, before=int(end_epoch), limit=100, sort="asc")
+        before = min(int(end_epoch), after + WINDOW_SECONDS)
+        params = dict(subreddit=subreddit, after=after, before=before, limit=100, sort="asc")
         if use_fields:
             params["fields"] = fields
-        r = _get_json(s, ARCTIC_URL, params, log)
-        if r.status_code == 400 and use_fields:
-            use_fields = False
-            continue
-        r.raise_for_status()
+        r = _get(s, ARCTIC_URL, params, log)
+        if r is None or not r.ok:
+            if r is not None and r.status_code == 400 and use_fields:
+                use_fields = False
+                continue
+            code = "no response" if r is None else f"{r.status_code} {r.text[:150]}"
+            raise PartialDownload(f"Arctic Shift kept failing ({code})", _clean_posts(pd.DataFrame(rows)))
         data = r.json().get("data") or []
-        if not data:
-            break
+        if not data:              # nothing left in this window -> move to the next one
+            after = before
+            continue
         rows.extend(data)
         last = max(int(float(d.get("created_utc", after))) for d in data)
         after = last if last > after else after + 1
         calls += 1
         if calls % 25 == 0:
             log(f"    ...{len(rows):,} posts so far (up to {pd.Timestamp(last, unit='s'):%Y-%m-%d %H:%M} UTC)")
+            if checkpoint:
+                checkpoint(_clean_posts(pd.DataFrame(rows)))
         time.sleep(pause)
     return _clean_posts(pd.DataFrame(rows))
 
 
 def fetch_posts_reddit_recent(max_pages=10, log=print) -> pd.DataFrame:
-    """Fallback: newest ~1000 posts straight from reddit.com (no history beyond that)."""
+    """Fallback: newest ~1000 posts straight from reddit.com. Reddit often blocks scripts (403);
+    in that case this returns an empty frame instead of failing."""
     s = requests.Session()
     s.headers["User-Agent"] = UA
     after, rows = None, []
     for _ in range(max_pages):
-        r = _get_json(s, REDDIT_NEW_URL, {"limit": 100, "after": after, "raw_json": 1}, log)
-        r.raise_for_status()
+        r = _get(s, REDDIT_NEW_URL, {"limit": 100, "after": after, "raw_json": 1}, log, tries=3)
+        if r is None or not r.ok:
+            log(f"    reddit.com refused the request ({'no response' if r is None else r.status_code}).")
+            break
         j = r.json()["data"]
         rows += [c["data"] for c in j["children"]]
         after = j.get("after")
@@ -158,40 +182,54 @@ def _clean_posts(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["score", "num_comments", "created_utc"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df["created_utc"] = df["created_utc"].astype("int64")
-    return df.drop_duplicates("id").sort_values("created_utc").reset_index(drop=True)
+    return df.drop_duplicates("id", keep="last").sort_values("created_utc").reset_index(drop=True)
 
 
 def load_or_fetch_posts(start, end, cache_file: Path, log=print, allow_reddit_fallback=True):
-    """Posts between start and end (tz-aware or UTC timestamps), cached incrementally on disk."""
+    """Posts between start and end, cached on disk. The cache only ever holds one unbroken
+    stretch of archive data, so an interrupted download resumes where it stopped next run."""
     start_e, end_e = int(pd.Timestamp(start).timestamp()), int(pd.Timestamp(end).timestamp())
     cache_file.parent.mkdir(parents=True, exist_ok=True)
+    comp = "gzip" if cache_file.suffix == ".gz" else None
     cached = _clean_posts(pd.read_csv(cache_file, dtype={"id": str})) if cache_file.exists() else _clean_posts(pd.DataFrame())
-    parts = [cached]
-    ranges = []
-    if cached.empty:
-        ranges.append((start_e, end_e))
-    else:
-        lo, hi = int(cached.created_utc.min()), int(cached.created_utc.max())
-        if start_e < lo - 3600:
-            ranges.append((start_e, lo))
-        if end_e > hi + 60:
-            ranges.append((hi, end_e))
-    for a, b in ranges:
-        log(f"  Downloading r/wallstreetbets posts {pd.Timestamp(a, unit='s'):%Y-%m-%d} -> "
-            f"{pd.Timestamp(b, unit='s'):%Y-%m-%d %H:%M} UTC from Arctic Shift...")
+
+    def save(df):
+        tmp = cache_file.with_name(cache_file.name + ".tmp")
+        df.to_csv(tmp, index=False, compression=comp)
+        tmp.replace(cache_file)
+
+    if not cached.empty and int(cached.created_utc.min()) > start_e + 3600:
+        # cache starts too late to extend backwards without leaving a hole: rebuild from scratch
+        cached = _clean_posts(pd.DataFrame())
+    base = cached
+    fetch_from = start_e if cached.empty else int(cached.created_utc.max())
+    extra = _clean_posts(pd.DataFrame())
+    if end_e > fetch_from + 60:
+        log(f"  Downloading r/wallstreetbets posts {pd.Timestamp(fetch_from, unit='s'):%Y-%m-%d %H:%M} -> "
+            f"{pd.Timestamp(end_e, unit='s'):%Y-%m-%d %H:%M} UTC from Arctic Shift...")
         try:
-            parts.append(fetch_posts_arctic(a, b, log=log))
-        except Exception as e:  # archive down -> recent posts only
-            log(f"  Arctic Shift failed ({e}).")
-            if not allow_reddit_fallback:
-                raise
-            log("  Falling back to reddit.com/new (only the newest ~1000 posts).")
-            parts.append(fetch_posts_reddit_recent(log=log))
-    allp = _clean_posts(pd.concat(parts, ignore_index=True))
-    # keep the newest copy of each post (scores keep changing)
-    allp.to_csv(cache_file, index=False, compression="gzip" if cache_file.suffix == ".gz" else None)
-    sel = allp[(allp.created_utc >= start_e) & (allp.created_utc < end_e)]
-    return sel.reset_index(drop=True)
+            new = fetch_posts_arctic(fetch_from, end_e, log=log,
+                                     checkpoint=lambda part: save(_clean_posts(pd.concat([base, part]))))
+            cached = _clean_posts(pd.concat([base, new], ignore_index=True))
+            save(cached)
+        except PartialDownload as e:
+            cached = _clean_posts(pd.concat([base, e.rows], ignore_index=True))
+            save(cached)
+            got_to = pd.Timestamp(int(cached.created_utc.max()), unit="s") if len(cached) else None
+            log(f"  {e}. Saved {len(cached):,} posts"
+                + (f" (through {got_to:%Y-%m-%d %H:%M} UTC)" if got_to is not None else "")
+                + "; the next run continues from there.")
+            if allow_reddit_fallback:
+                log("  Trying reddit.com/new for the newest posts (only ~1000; not saved to the cache)...")
+                extra = fetch_posts_reddit_recent(log=log)
+    allp = _clean_posts(pd.concat([cached, extra], ignore_index=True))
+    sel = allp[(allp.created_utc >= start_e) & (allp.created_utc < end_e)].reset_index(drop=True)
+    if len(sel):
+        newest = pd.Timestamp(int(sel.created_utc.max()), unit="s")
+        if end_e - sel.created_utc.max() > 6 * 3600:
+            log(f"  WARNING: posts only reach {newest:%Y-%m-%d %H:%M} UTC; recent days are missing. "
+                "Results use what was downloaded.")
+    return sel
 
 
 # --------------------------------------------------------------------------- tickers
