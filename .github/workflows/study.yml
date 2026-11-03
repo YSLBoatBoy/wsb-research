@@ -1,0 +1,42 @@
+name: Run WSB correlation study
+
+# Run it from the Actions tab ("Run workflow"). The report is attached to the run
+# as a downloadable artifact named wsb-report.
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Calendar days of history (120 = ~3 months + warm-up)"
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WSB_DATA_DIR: ${{ github.workspace }}/data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Reuse downloaded posts between runs
+        uses: actions/cache@v4
+        with:
+          path: data/posts.csv.gz
+          key: wsb-posts-${{ github.run_id }}
+          restore-keys: wsb-posts-
+      - run: python wsb_analyze.py --days "${{ inputs.days }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wsb-report
+          path: |
+            data/report/
+            data/best_config.json
+          retention-days: 30

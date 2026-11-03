@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>wsb-research</Name>
+  <Repository>ghcr.io/yslboatboy/wsb-research:latest</Repository>
+  <Registry>https://github.com/YSLBoatBoy/wsb-research/pkgs/container/wsb-research</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/YSLBoatBoy/wsb-research</Support>
+  <Project>https://github.com/YSLBoatBoy/wsb-research</Project>
+  <Overview>Tracks r/wallstreetbets, tests whether trending tickers predict stock returns, and paper trades the signal with fake money. Web dashboard on the WebUI port.</Overview>
+  <Category>Tools: Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/YSLBoatBoy/wsb-research/main/unraid/icon.png</Icon>
+  <ExtraParams>--user 99:100</ExtraParams>
+  <Config Name="Web UI port" Target="8080" Default="8088" Mode="tcp" Description="Dashboard port on your server" Type="Port" Display="always" Required="true" Mask="false">8088</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/wsb-research" Mode="rw" Description="Posts cache, reports, paper portfolio" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/wsb-research</Config>
+  <Config Name="Time zone" Target="TZ" Default="America/Chicago" Mode="" Description="Schedule times below use this zone" Type="Variable" Display="always" Required="true" Mask="false">America/Chicago</Config>
+  <Config Name="Paper trader time" Target="PAPER_TIME" Default="08:15" Mode="" Description="Weekday run time, before the 9:30 ET open (8:30 Central)" Type="Variable" Display="always" Required="false" Mask="false">08:15</Config>
+  <Config Name="Study day" Target="ANALYZE_DAY" Default="sun" Mode="" Description="Day of week to re-run the correlation study" Type="Variable" Display="always" Required="false" Mask="false">sun</Config>
+  <Config Name="Study time" Target="ANALYZE_TIME" Default="18:00" Mode="" Description="" Type="Variable" Display="always" Required="false" Mask="false">18:00</Config>
+  <Config Name="Study history (days)" Target="ANALYZE_DAYS" Default="120" Mode="" Description="120 = ~3 months plus warm-up" Type="Variable" Display="always" Required="false" Mask="false">120</Config>
+  <Config Name="Paper capital" Target="PAPER_CAPITAL" Default="100000" Mode="" Description="Fake starting money" Type="Variable" Display="always" Required="false" Mask="false">100000</Config>
+</Container>
