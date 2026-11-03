@@ -253,7 +253,8 @@ def cmd_replay(args):
         posts = wc.load_or_fetch_posts(start, now, wc.DATA_DIR / "posts_live.csv.gz")
         universe = wc.load_ticker_universe()
         days = wc.trading_days(now - pd.Timedelta(days=args.days), now.tz_localize(None))
-        days = days[days < now.tz_localize(None).normalize()]
+        now_n = wc.naive_et(now)
+        days = days[days + pd.Timedelta(hours=9, minutes=29) <= now_n]
         opens = closes = None
     cache = {}
 
@@ -278,6 +279,11 @@ def cmd_replay(args):
         lo = cut - HISTORY_DAYS * 86400
         p = posts[(ts < cut) & (ts >= lo)]
         step(book, p, universe, price_fn, now_et, log=print if args.verbose else (lambda *_: None))
+    if not args.demo:   # settle up to the latest finished session, like a live run would
+        cal = wc.trading_days(now_n - pd.Timedelta(days=10), now_n)
+        done = cal[-1] if now_n >= cal[-1] + pd.Timedelta(hours=16, minutes=15) else cal[cal < now_n.normalize()][-1]
+        process_fills(book, price_fn, done, print if args.verbose else (lambda *_: None))
+        book.save()
     print_status(book)
     if args.demo:   # cross-check against the vectorised backtest
         import wsb_analyze as wa

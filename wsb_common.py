@@ -59,14 +59,20 @@ class NYSECalendar(AbstractHolidayCalendar):
 NYSE_BDAY = CustomBusinessDay(calendar=NYSECalendar())
 
 
+def naive_et(ts) -> pd.Timestamp:
+    """Any timestamp -> New York wall-clock time without a time zone (what the calendar uses)."""
+    ts = pd.Timestamp(ts)
+    return ts.tz_convert(ET).tz_localize(None) if ts.tzinfo else ts
+
+
 def trading_days(start, end) -> pd.DatetimeIndex:
     """NYSE trading days between start and end (inclusive), tz-naive midnight timestamps."""
-    return pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize(),
-                         freq=NYSE_BDAY)
+    return pd.date_range(naive_et(start).normalize(), naive_et(end).normalize(), freq=NYSE_BDAY)
 
 
 def add_trading_days(day, n: int) -> pd.Timestamp:
-    return pd.Timestamp(day).normalize() + n * NYSE_BDAY if n else pd.Timestamp(day).normalize()
+    d = naive_et(day).normalize()
+    return d + n * NYSE_BDAY if n else d
 
 
 def assign_entry_day(created_utc: pd.Series, days: pd.DatetimeIndex) -> pd.Series:
